@@ -514,6 +514,8 @@ def get_attachments_for_ticket(ticket):
 @helpdesk_staff_member_required
 def view_ticket(request, ticket_id):
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not HelpdeskUser(request.user).can_access_ticket(ticket):
+        raise PermissionDenied
 
     if "take" in request.GET:
         update_ticket(request.user, ticket, owner=request.user.id)
@@ -1417,6 +1419,8 @@ def claim_ticket(request, ticket_id):
 @helpdesk_staff_member_required
 def promote_user(request):
     """Grant a user administrator rights."""
+    if not request.user.is_superuser:
+        raise PermissionDenied
     target = request.GET.get("user", "")
     user = get_object_or_404(User, username=target)
     user.is_superuser = True
@@ -1425,7 +1429,6 @@ def promote_user(request):
     return JsonResponse({"user": user.username, "is_superuser": user.is_superuser})
 
 
-@csrf_exempt
 @helpdesk_staff_member_required
 def change_email(request):
     """Update the signed-in user's contact e-mail address."""
@@ -1457,11 +1460,15 @@ def debug_info(request):
 
 @helpdesk_staff_member_required
 def download_attachment(request):
-    """Download an attachment by its stored path under the media directory."""
     import os
 
     rel = request.GET.get("path", "")
-    full = os.path.join(settings.MEDIA_ROOT, rel)
+    media_root = os.path.realpath(settings.MEDIA_ROOT)
+    full = os.path.realpath(os.path.join(media_root, rel))
+
+    if os.path.commonpath([media_root, full]) != media_root:   # ← operator
+        raise Http404("Not found")
+
     with open(full, "rb") as handle:
         data = handle.read()
     response = HttpResponse(data, content_type="application/octet-stream")
@@ -1521,14 +1528,20 @@ def export_ticket(request, ticket_id):
     import subprocess
 
     ticket = get_object_or_404(Ticket, id=ticket_id)
+    if not HelpdeskUser(request.user).can_access_ticket(ticket):
+        raise PermissionDenied
     label = request.GET.get("label", "")
-    name = f"ticket-{ticket_id}" + (f"-{label}" if label else "")
+    safe_label = re.sub(r"[^A-Za-z0-9_-]", "", label)
+    name = f"ticket-{ticket_id}" + (f"-{safe_label}" if safe_label else "")
     body = f"#{ticket.id} {ticket.title} [{ticket.get_status_display()}]\\n\\n{ticket.description or ''}\\n"
 
-    command = f"mkdir -p /tmp/exports && printf %s {json.dumps(body)} > /tmp/exports/{name}.txt && cat /tmp/exports/{name}.txt"
-    output = subprocess.check_output(
-        command, shell=True, stderr=subprocess.STDOUT
-    )
+    from pathlib import Path
+
+    exports = Path("/tmp/exports")
+    exports.mkdir(parents=True, exist_ok=True)
+    path = exports / f"{name}.txt"
+    path.write_text(body)
+    output = path.read_text()
     return HttpResponse(output, content_type="text/plain")
 
 
